@@ -68,9 +68,9 @@ func TestReconcileNodeAvailability(t *testing.T) {
 					if !ctl.runUntilQuiet(t, minTotalDigestQueued, false, time.Second*3, time.Second*20) {
 						return
 					}
+					ctl.digestQueue.StopTestWorkers(ctx)
 					cs.ClearActions()
 					fmaCS.ClearActions()
-					ctl.digestQueue.StopTestWorkers(ctx)
 
 					allowedActions := []actionAbstract{}
 					if nodeState == "deleting" {

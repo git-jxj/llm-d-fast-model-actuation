@@ -19,6 +19,7 @@ package generic
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -54,6 +55,10 @@ type QueueAndWorkers[Item comparable] struct {
 	stopChan chan struct{}
 
 	stopped *atomic.Bool
+
+	// processingMu coordinates stopping with worker admission and completion.
+	// Readers hold it from the stop check through all item cleanup.
+	processingMu *sync.RWMutex
 }
 
 // NewQueueAndWorkers makes a new QueueAndWorkers.
@@ -101,6 +106,7 @@ func newQueueAndWorkers[Item comparable](
 		approxLastWorkTime: new(atomic.Value),
 		stopChan:           make(chan struct{}),
 		stopped:            new(atomic.Bool),
+		processingMu:       new(sync.RWMutex),
 	}
 	ans.approxLastWorkTime.Store(time.Now())
 	return ans
@@ -125,13 +131,20 @@ func (ctl *QueueAndWorkers[Item]) StartWorkers(ctx context.Context) error {
 }
 
 // StopTestWorkers is a hack for use in tests of clients of this controller.
-// Calling this suppresses further work on queue items.
+// Calling this suppresses further work on queue items and waits for work
+// already admitted to finish, including its cleanup.
+// For KnowsProcessedSync, wait for HasProcessedSync before calling this,
+// so stopping cannot block workers needed by the initial sentinel barrier.
+// Do not call this from a worker's processing callback.
 // This would only be used near the end of a test,
 // when no further queue item processing is intended and the whole
 // controller is about to become unreachable.
 // It is the first simplest step in the direction of giving tests
 // control over the scheduling of processing of queue items.
 func (ctl *QueueAndWorkers[Item]) StopTestWorkers(ctx context.Context) {
+	ctl.processingMu.Lock()
+	defer ctl.processingMu.Unlock()
+
 	logger := klog.FromContext(ctx)
 	changed := ctl.stopped.CompareAndSwap(false, true)
 	if changed {
@@ -153,6 +166,12 @@ func (ctl *QueueAndWorkers[Item]) processNextWorkItem(ctx context.Context) bool 
 	if shutdown {
 		return false
 	}
+	// Get may block indefinitely on an empty queue, so acquire the lock only
+	// after it returns. Register this defer first so item cleanup runs before
+	// a waiting StopTestWorkers can acquire the write lock.
+	ctl.processingMu.RLock()
+	defer ctl.processingMu.RUnlock()
+
 	select {
 	case <-ctl.stopChan:
 		logger.Info("Worker aborted for testing")
