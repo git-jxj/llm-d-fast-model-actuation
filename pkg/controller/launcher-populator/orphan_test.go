@@ -45,32 +45,42 @@ func TestReconcileNodeAvailability(t *testing.T) {
 		for _, templateState := range []string{"current", "stale", "no-pods"} {
 			for _, desiredCount := range []int32{0, 2} {
 				t.Run(fmt.Sprintf("%s/%s/desired-%d", nodeState, templateState, desiredCount), func(t *testing.T) {
+					var lpp *fmav1alpha1.LauncherPopulationPolicy
 					var node *corev1.Node
 					var setupObjs []runtime.Object
-					var minTotalDigestQueued int
 					if templateState != "no-pods" {
 						var orphan *corev1.Pod
-						_, node, orphan, _, setupObjs = orphanLifecycleObjects(t, desiredCount, false, true)
+						lpp, node, orphan, _, setupObjs = orphanLifecycleObjects(t, desiredCount, false, true)
 						if templateState == "stale" {
 							orphan.Annotations[common.LauncherTemplateHashAnnotationKey] = "stale-template"
 						}
-						minTotalDigestQueued = len(setupObjs) - 2
 					} else {
 						var err error
-						_, _, _, node, setupObjs, err = orphanSetupObjects(desiredCount)
+						_, _, lpp, node, setupObjs, err = orphanSetupObjects(desiredCount)
 						if err != nil {
 							t.Fatalf("Failed to construct template Pod: %v", err)
 						}
-						minTotalDigestQueued = len(setupObjs)
 					}
 					ctx := t.Context()
-					ctl, cs, fmaCS, _ := newStuckTestController(t, ctx, stuckTestNow, digestOnly, setupObjs...)
-					if !ctl.runUntilQuiet(t, minTotalDigestQueued, false, time.Second*3, time.Second*20) {
-						return
+					ctl, cs, fmaCS, _ := newStuckTestController(t, ctx, stuckTestNow, noWorkers, setupObjs...)
+					key := stuckTestKey()
+
+					// Seed the digest while the Node is available and leave it unchanged
+					// when the informer sees the Node disappear or start deleting.
+					for _, item := range []funcItem{
+						{Kind: kindLC, Name: key.LauncherConfigName},
+						{Kind: kindLPP, Name: lpp.Name},
+					} {
+						if err, _ := ctl.processDigestItem(ctx, item); err != nil {
+							t.Fatalf("processDigestItem(%+v): %v", item, err)
+						}
+					}
+					if snap := ctl.policy.snapshotForKey(key); !snap.exists || snap.desiredCount != int(desiredCount) {
+						t.Fatalf("Expected a policy digest entry with desiredCount=%d, got exists=%t and desiredCount=%d",
+							desiredCount, snap.exists, snap.desiredCount)
 					}
 					cs.ClearActions()
 					fmaCS.ClearActions()
-					ctl.digestQueue.StopTestWorkers(ctx)
 
 					allowedActions := []actionAbstract{}
 					if nodeState == "deleting" {
@@ -91,9 +101,9 @@ func TestReconcileNodeAvailability(t *testing.T) {
 						allowedActions = append(allowedActions, actionAbstract{"delete", "nodes"})
 						waitForNodeGoneFromCache(t, ctl, node.Name)
 					}
-					err, requeue := ctl.processKey(ctx, stuckTestKey())
+					err, requeue := ctl.processKey(ctx, key)
 					if err != nil {
-						t.Fatalf("reconcileKey: %v", err)
+						t.Fatalf("processKey: %v", err)
 					}
 					if templateState == "no-pods" {
 						checkActions(t, cs.Actions(), allowedActions)
